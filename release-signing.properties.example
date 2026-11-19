@@ -1,0 +1,7 @@
+# Copy to release-signing.properties (ignored by Git), or point
+# LIRIUM_SIGNING_PROPERTIES at a private properties file outside the repository.
+# Use forward slashes in an absolute Windows path.
+storeFile=C:/path/to/liriumai-release.jks
+storePassword=REPLACE_LOCALLY
+keyAlias=liriumai
+keyPassword=REPLACE_LOCALLY

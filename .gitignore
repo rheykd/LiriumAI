@@ -1,0 +1,32 @@
+# Local configuration and credentials
+local.properties
+release-signing.properties
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.pem
+*.key
+
+# Generated output and local tooling
+.gradle/
+.kotlin/
+**/build/
+**/.cxx/
+.idea/
+*.iml
+captures/
+.DS_Store
+Thumbs.db
+
+# Installation packages and temporary source archives
+*.apk
+*.aab
+/*.zip
+/_font/
+/_font_montserrat/
+
+# Downloaded model weights
+*.gguf
+*.safetensors

@@ -2,6 +2,7 @@ package com.localmodels.app.engine
 
 interface TokenSink {
     fun onToken(text: String)
+    fun onStats(tokens: Int, generationMs: Long) {}
 }
 
 /**
@@ -34,6 +35,8 @@ object LlamaBridge {
     external fun restoreHistory(roles: Array<String>, texts: Array<String>, system: String)
 
     external fun visionSupported(): Boolean
+
+    external fun clearStop()
 
     external fun stop()
 

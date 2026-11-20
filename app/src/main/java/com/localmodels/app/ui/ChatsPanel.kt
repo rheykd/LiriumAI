@@ -20,16 +20,17 @@ fun ChatsPanel(vm: AppViewModel, onClose: () -> Unit) {
     var deleting by remember { mutableStateOf<ChatRecord?>(null) }
     Column(Modifier.fillMaxSize().background(Surface).padding(horizontal = 12.dp)) {
         Text("чаты", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(12.dp))
-        TextButton(enabled = !vm.busy, onClick = { vm.newChat(); onClose() }, modifier = Modifier.fillMaxWidth()) {
+        TextButton(enabled = !vm.busy && !vm.archiveBusy, onClick = { vm.newChat(); onClose() }, modifier = Modifier.fillMaxWidth()) {
             Text("новый чат", color = TextPrimary)
         }
+        BackupActions(vm)
         if (vm.busy) Text("для переключения или удаления сначала остановите ответ",
             color = TextMuted, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(12.dp))
         LazyColumn(Modifier.weight(1f)) {
             items(vm.chats.sortedByDescending { it.updatedAt }, key = { it.id }) { chat ->
                 Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
                     .background(if (chat.id == vm.activeChatId) SurfaceHigh else Surface)
-                    .clickable(enabled = !vm.busy) { vm.selectChat(chat.id); onClose() }
+                    .clickable(enabled = !vm.busy && !vm.archiveBusy) { vm.selectChat(chat.id); onClose() }
                     .padding(start = 12.dp, top = 10.dp, bottom = 10.dp)) {
                     Column(Modifier.weight(1f)) {
                         Text(chat.title, color = TextPrimary, style = MaterialTheme.typography.bodyMedium,
@@ -39,7 +40,7 @@ fun ChatsPanel(vm: AppViewModel, onClose: () -> Unit) {
                         Text("${chat.messages.count { it.fromUser }} запросов", color = TextMuted,
                             style = MaterialTheme.typography.labelSmall)
                     }
-                    TextButton(enabled = !vm.busy, onClick = { deleting = chat }) {
+                    TextButton(enabled = !vm.busy && !vm.archiveBusy, onClick = { deleting = chat }) {
                         Text("удалить", color = TextSecondary, style = MaterialTheme.typography.labelSmall)
                     }
                 }

@@ -373,7 +373,7 @@ Java_com_localmodels_app_engine_LlamaBridge_restoreHistory(JNIEnv * env, jobject
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_engine || !g_engine->ctx) { throw_illegal(env, "model is not loaded"); return; }
     Engine & e = *g_engine;
-    g_stop.store(false);
+
     e.history.clear();
     clear_kv(e);
     try {
@@ -425,6 +425,11 @@ Java_com_localmodels_app_engine_LlamaBridge_restoreHistory(JNIEnv * env, jobject
 }
 
 JNIEXPORT void JNICALL
+Java_com_localmodels_app_engine_LlamaBridge_clearStop(JNIEnv *, jobject) {
+    g_stop.store(false);
+}
+
+JNIEXPORT void JNICALL
 Java_com_localmodels_app_engine_LlamaBridge_stop(JNIEnv *, jobject) {
     g_stop.store(true);
 }
@@ -441,7 +446,7 @@ Java_com_localmodels_app_engine_LlamaBridge_chat(JNIEnv * env, jobject,
         jstring jsystem, jobject sink) {
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_stop.store(false);
+
 
     if (!g_engine || !g_engine->ctx) {
         throw_illegal(env, "model is not loaded");
@@ -677,6 +682,16 @@ Java_com_localmodels_app_engine_LlamaBridge_chat(JNIEnv * env, jobject,
 
     emit_utf8(env, sink_ref, on_token, pending_utf8, true);
     common_sampler_free(smpl);
+    if (sink_ref && !env->ExceptionCheck()) {
+        jclass cls = env->GetObjectClass(sink_ref);
+        jmethodID stats = env->GetMethodID(cls, "onStats", "(IJ)V");
+        if (stats) {
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_gen).count();
+            env->CallVoidMethod(sink_ref, stats, (jint) generated, (jlong) duration);
+        }
+        env->DeleteLocalRef(cls);
+    }
     if (sink_ref) env->DeleteGlobalRef(sink_ref);
 
     {

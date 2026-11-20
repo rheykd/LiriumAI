@@ -26,6 +26,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** Live state of the optional LAN host, read by Compose. */
 object LanHost {
+    var clients by mutableStateOf(emptyList<LanClient>())
+    internal var disconnectClient: ((String) -> Unit)? = null
+    fun disconnect(id: String) { disconnectClient?.invoke(id) }
     var running by mutableStateOf(false)
     var address by mutableStateOf("")
     var error by mutableStateOf<String?>(null)
@@ -42,7 +45,10 @@ class LanServer(
 ) {
     private val prefs = Prefs(app)
     private val store = ModelStore(app)
-    private val token = sha256(password)
+    private val sessions = LanSessions()
+    @Volatile private var activeSessionId: String? = null
+    private val ui = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun publishClients() { val list = sessions.clients(); ui.post { if (running.get()) LanHost.clients = list } }
     private val running = AtomicBoolean(false)
     private val pool = Executors.newCachedThreadPool()
     private var socket: ServerSocket? = null
@@ -52,6 +58,11 @@ class LanServer(
         val ss = ServerSocket(port)
         socket = ss
         running.set(true)
+        LanHost.disconnectClient = { id ->
+            sessions.revoke(id)
+            if (activeSessionId == id) LocalEngine.stop()
+            publishClients()
+        }
         LanHost.address = "http://${localIp()}:$port"
         LanHost.running = true
         pool.execute {
@@ -76,6 +87,10 @@ class LanServer(
 
     fun stop() {
         running.set(false)
+        sessions.clear()
+        if (activeSessionId != null) LocalEngine.stop()
+        LanHost.disconnectClient = null
+        LanHost.clients = emptyList()
         runCatching { socket?.close() }
         socket = null
         LanHost.running = false
@@ -87,7 +102,7 @@ class LanServer(
         client.use { c ->
             c.soTimeout = 120_000
             try {
-                val req = readRequest(c.getInputStream()) ?: return
+                val req = (readRequest(c.getInputStream()) ?: return).copy(peer = c.inetAddress.hostAddress.orEmpty())
                 val out = c.getOutputStream()
                 route(req, out)
                 out.flush()
@@ -99,9 +114,11 @@ class LanServer(
 
     private fun route(req: Request, out: OutputStream) {
         val path = req.path
+        val session = session(req)
+        publishClients()
         when {
             req.method == "GET" && path == "/" -> {
-                if (authorized(req)) {
+                if (session != null) {
                     respond(out, 200, "text/html; charset=utf-8", panelHtml())
                 } else {
                     respond(out, 200, "text/html; charset=utf-8", loginHtml())
@@ -111,27 +128,35 @@ class LanServer(
                 val form = String(req.body, Charsets.UTF_8)
                 val given = form.split("&").firstOrNull { it.startsWith("password=") }
                     ?.substringAfter('=')?.let { URLDecoder.decode(it, "UTF-8") }
-                    ?: JSONObject(form).optString("password")
+                    ?: runCatching { JSONObject(form).optString("password") }.getOrDefault("")
                 if (given == password) {
+                    session?.let { sessions.revoke(it.id) }
+                    val loggedIn = runCatching { sessions.create(req.headers["user-agent"].orEmpty().take(80).ifBlank { "браузер" }, req.peer) }
+                        .getOrElse { respond(out, 409, "application/json", jsonError(it.message ?: "лимит сессий")); return }
+                    publishClients()
+                    val json = req.headers["content-type"].orEmpty().contains("application/json")
                     respond(
-                        out, 302, "text/plain; charset=utf-8", "",
-                        listOf("Location: /", "Set-Cookie: lirium=$token; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
+                        out, if (json) 200 else 302, if (json) "application/json" else "text/plain; charset=utf-8",
+                        if (json) JSONObject().put("session", loggedIn.token).toString() else "",
+                        listOf("Location: /", "Set-Cookie: lirium=${loggedIn.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
                     )
                 } else {
                     respond(out, 401, "text/html; charset=utf-8", loginHtml("неверный пароль"))
                 }
             }
             req.method == "GET" && path == "/logout" -> {
+                session?.let { sessions.revoke(it.id); if (activeSessionId == it.id) LocalEngine.stop() }
+                publishClients()
                 respond(
                     out, 302, "text/plain; charset=utf-8", "",
                     listOf("Location: /", "Set-Cookie: lirium=; Path=/; Max-Age=0")
                 )
             }
-            !authorized(req) -> {
+            session == null -> {
                 respond(out, 401, "application/json; charset=utf-8", jsonError("нужен пароль"))
             }
             req.method == "GET" && path == "/api/state" -> {
-                respond(out, 200, "application/json; charset=utf-8", stateJson().toString())
+                respond(out, 200, "application/json; charset=utf-8", stateJson(session).toString())
             }
             req.method == "POST" && path == "/api/load" -> {
                 val body = runCatching { JSONObject(String(req.body, Charsets.UTF_8)) }.getOrNull()
@@ -142,21 +167,36 @@ class LanServer(
                 } else if (!store.isInstalled(model)) {
                     respond(out, 409, "application/json; charset=utf-8", jsonError("модель не скачана"))
                 } else {
+                    if (!session.busy.compareAndSet(false, true)) { respond(out, 409, "application/json", jsonError("сначала остановите ответ")); return }
+                    try {
+                    session.modelId = model.id
+                    session.history = emptyList()
+                    session.messages = emptyList()
+                    session.revision++
                     val rc = LocalEngine.exclusive {
-                        val result = LocalEngine.load(app, store, model)
-                        if (result == 0) LocalEngine.reset()
-                        result
+                        if (session.revoked) 1 else LocalEngine.load(app, store, model)
                     }
                     if (rc == 0) {
-                        respond(out, 200, "application/json; charset=utf-8", stateJson().toString())
+                        respond(out, 200, "application/json; charset=utf-8", stateJson(session).toString())
                     } else {
                         respond(out, 500, "application/json; charset=utf-8", jsonError("не удалось загрузить"))
                     }
+                    } finally { session.busy.set(false); publishClients() }
                 }
             }
             req.method == "POST" && path == "/api/reset" -> {
-                LocalEngine.reset()
+                if (!session.busy.compareAndSet(false, true)) { respond(out, 409, "application/json", jsonError("сначала остановите ответ")); return }
+                try {
+                    session.history = emptyList()
+                    session.messages = emptyList()
+                    session.revision++
+                } finally { session.busy.set(false) }
                 respond(out, 200, "application/json; charset=utf-8", "{\"ok\":true}")
+            }
+            req.method == "POST" && path == "/api/stop" -> {
+                session.control.cancel()
+                if (activeSessionId == session.id) LocalEngine.stop()
+                respond(out, 200, "application/json", "{\"ok\":true}")
             }
             req.method == "POST" && path == "/api/chat" -> {
                 val body = runCatching { JSONObject(String(req.body, Charsets.UTF_8)) }.getOrNull()
@@ -178,7 +218,7 @@ class LanServer(
                             "X-Accel-Buffering: no\r\n\r\n").toByteArray()
                     )
                     out.flush()
-                    val full = try { runChat(text, modelId) { piece ->
+                    val full = try { runChat(session, text, modelId) { piece ->
                         val data = JSONObject().put("token", piece).toString()
                         synchronized(out) {
                             out.write("data: $data\n\n".toByteArray(Charsets.UTF_8))
@@ -196,7 +236,7 @@ class LanServer(
                         out.flush()
                     }
                 } else {
-                    val full = runChat(text, modelId) { }
+                    val full = runChat(session, text, modelId) { }
                     respond(
                         out, 200, "application/json; charset=utf-8",
                         JSONObject().put("text", full).toString()
@@ -207,42 +247,63 @@ class LanServer(
         }
     }
 
-    private fun runChat(userText: String, modelId: String?, onToken: (String) -> Unit): String = LocalEngine.exclusive {
-        LocalEngine.useSession("lan")
-        if (modelId != null) {
-            val model = loadCatalog().firstOrNull { it.id == modelId }
-                ?: throw IllegalArgumentException("модель не найдена")
-            check(store.isInstalled(model)) { "модель не скачана" }
-            check(LocalEngine.load(app, store, model) == 0) { "не удалось загрузить модель" }
-        }
-        val webPrompt = runBlocking { Web.preparePrompt(userText, prefs.internetEnabled) }
-        var prompt = webPrompt.text
-        val system = SystemPrompt.build(prefs.internetEnabled)
-        var finalAnswer = ""
-        for (round in 0 until 3) {
-            val sb = StringBuilder()
-            LocalEngine.chat(
-                prompt, emptyArray(), IntArray(0), IntArray(0),
-                512, 0.7f, 0.95f, 40, 1.1f, system,
-                object : TokenSink {
-                    override fun onToken(text: String) {
-                        sb.append(text)
-                        onToken(text)
+    private fun runChat(session: LanSession, userText: String, modelId: String?, onToken: (String) -> Unit): String {
+        check(session.busy.compareAndSet(false, true)) { "в этой сессии уже выполняется запрос" }
+        val control = RequestControl()
+        session.control = control
+        publishClients()
+        try {
+            check(!session.revoked) { "сессия отключена на телефоне" }
+            val webPrompt = runBlocking { Web.preparePrompt(userText, prefs.internetEnabled, control = control) }
+            return LocalEngine.exclusive {
+                control.checkActive()
+                check(!session.revoked) { "сессия отключена на телефоне" }
+                activeSessionId = session.id
+                try {
+                    val chosen = modelId ?: session.modelId ?: LocalEngine.loadedModelId
+                    val model = loadCatalog().firstOrNull { it.id == chosen } ?: error("выберите модель")
+                    check(store.isInstalled(model)) { "модель не скачана" }
+                    check(LocalEngine.load(app, store, model) == 0) { "не удалось загрузить модель" }
+                    if (session.modelId != model.id) { session.history = emptyList(); session.messages = emptyList(); session.modelId = model.id }
+                    val system = SystemPrompt.build(prefs.internetEnabled)
+                    val history = session.history.toMutableList()
+                    LocalEngine.useConversation("lan/${session.id}/${session.revision++}", history, system, cancelled = { control.cancelled || session.revoked })
+                    var prompt = webPrompt.text
+                    var finalAnswer = ""
+                    for (round in 0 until 3) {
+                        control.checkActive()
+                        val sb = StringBuilder()
+                        LocalEngine.chat(prompt, emptyArray(), IntArray(0), IntArray(0),
+                            512, 0.7f, 0.95f, 40, 1.1f, system,
+                            object : TokenSink {
+                                override fun onToken(text: String) {
+                                    control.checkActive()
+                                    sb.append(text); onToken(text)
+                                }
+                            }, cancelled = { control.cancelled || session.revoked })
+                        control.checkActive()
+                        val answer = sb.toString()
+                        history += ChatTurn("user", prompt)
+                        history += ChatTurn("assistant", answer)
+                        finalAnswer = Web.stripFetchLines(answer)
+                        if (!prefs.internetEnabled || round >= 2) break
+                        prompt = runBlocking { Web.followUp(answer, webPrompt, control = control) } ?: break
                     }
-                }
-            )
-            val answer = sb.toString()
-            finalAnswer = Web.stripFetchLines(answer)
-            if (!prefs.internetEnabled || round >= 2) break
-            prompt = runBlocking { Web.followUp(answer, webPrompt) } ?: break
-        }
-        Web.correctedAnswer(finalAnswer, webPrompt)
+                    control.checkActive()
+                    check(!session.revoked) { "сессия отключена" }
+                    val corrected = Web.correctedAnswer(finalAnswer, webPrompt)
+                    session.history = ChatHistory.bounded(history)
+                    session.messages = (session.messages + ChatTurn("user", userText) + ChatTurn("assistant", corrected)).takeLast(100)
+                    corrected
+                } finally { activeSessionId = null }
+            }
+        } finally { session.busy.set(false); publishClients() }
     }
 
     private fun loadCatalog(): List<CatalogModel> =
         Catalog.load(app, prefs.customCatalogJson)
 
-    private fun stateJson(): JSONObject {
+    private fun stateJson(session: LanSession): JSONObject {
         val installed = store.installedModels(loadCatalog())
         val arr = JSONArray()
         for (m in installed) {
@@ -252,22 +313,22 @@ class LanServer(
                     .put("name", m.name)
                     .put("vision", m.vision)
                     .put("bytes", m.bytes)
-                    .put("loaded", m.id == LocalEngine.loadedModelId)
+                    .put("loaded", m.id == session.modelId)
             )
         }
         return JSONObject()
             .put("app", "LiriumAI")
             .put("models", arr)
-            .put("loaded", LocalEngine.loadedModelId ?: JSONObject.NULL)
+            .put("loaded", session.modelId ?: JSONObject.NULL)
             .put("running", LanHost.running)
+            .put("messages", JSONArray(session.messages.map { JSONObject().put("role", it.role).put("text", it.text) }))
     }
 
-    private fun authorized(req: Request): Boolean {
-        if (req.headers["authorization"] == "Bearer $password") return true
-        if (req.headers["x-password"] == password) return true
-        if (req.query["pw"] == password) return true
-        val cookie = req.headers["cookie"] ?: return false
-        return cookie.split(";").any { it.trim() == "lirium=$token" }
+    private fun session(req: Request): LanSession? {
+        val token = req.headers["cookie"].orEmpty().split(';').map { it.trim() }
+            .firstOrNull { it.startsWith("lirium=") }?.substringAfter('=')
+            ?: req.headers["x-session"]
+        return sessions.find(token)
     }
 
     private fun jsonError(message: String): String =
@@ -311,7 +372,8 @@ class LanServer(
         val path: String,
         val query: Map<String, String>,
         val headers: Map<String, String>,
-        val body: ByteArray
+        val body: ByteArray,
+        val peer: String = ""
     )
 
     private fun readRequest(input: InputStream): Request? {
@@ -432,7 +494,7 @@ a{color:#8c8c8c;font-size:12px;margin-left:auto;text-decoration:none}
 </style></head><body>
 <header><b>LiriumAI</b>
 <select id="model"></select>
-<a href="/logout">выйти</a></header>
+<button id="reset">новый чат</button><button id="stop">стоп</button><a href="/logout">выйти</a></header>
 <div id="log"></div>
 <footer><textarea id="text" placeholder="сообщение"></textarea>
 <button id="send">отправить</button></footer>
@@ -441,13 +503,16 @@ var log=document.getElementById('log'),sel=document.getElementById('model');
 var text=document.getElementById('text'),send=document.getElementById('send'),busy=false,loaded=null;
 function add(cls,content){var d=document.createElement('div');d.className='msg '+cls;
 d.textContent=content;log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
-async function loadState(){var r=await fetch('/api/state');if(!r.ok)return;
+document.getElementById('stop').onclick=function(){fetch('/api/stop',{method:'POST'})};
+document.getElementById('reset').onclick=async function(){if(busy)return;var r=await fetch('/api/reset',{method:'POST'});if(r.ok)log.textContent=''};
+async function loadState(){var r=await fetch('/api/state');if(!r.ok){if(r.status===401){send.disabled=true;sel.disabled=true;document.getElementById('text').disabled=true;log.textContent='Сессия отключена. Обновите страницу и войдите заново.'}return;}
 var s=await r.json();loaded=s.loaded;var have=Array.from(sel.options).map(function(o){return o.value}).join();
 var want=s.models.map(function(m){return m.id}).join();
 if(have!==want){sel.innerHTML='';
 s.models.forEach(function(m){var o=document.createElement('option');o.value=m.id;
 o.textContent=m.name+(m.vision?' / фото':'');sel.appendChild(o)})}
-if(!busy&&loaded)sel.value=loaded}
+if(!busy&&loaded)sel.value=loaded;
+if(!busy&&!log.children.length&&s.messages)s.messages.forEach(function(m){add(m.role==='user'?'user':'bot',m.text)})}
 async function choose(){if(!sel.value||busy)return;busy=true;send.disabled=true;sel.disabled=true;
 try{var r=await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/json'},
 body:JSON.stringify({id:sel.value})});var s=await r.json();if(!r.ok)throw Error(s.error||('HTTP '+r.status));

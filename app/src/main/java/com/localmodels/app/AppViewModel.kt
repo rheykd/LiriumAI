@@ -35,6 +35,9 @@ import com.localmodels.app.data.ChatStore
 import com.localmodels.app.data.ChatRecord
 import com.localmodels.app.data.ChatSnapshot
 import com.localmodels.app.data.ChatTurn
+import com.localmodels.app.data.*
+import android.os.Debug
+import java.nio.file.Files
 import com.localmodels.app.data.ChatHistory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
@@ -63,6 +66,7 @@ typealias UiMessage = com.localmodels.app.data.ChatMessage
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = Prefs(app)
+    val voice = VoiceController(app, viewModelScope, ::showInfo)
     val store = ModelStore(app)
     private val chatStore = ChatStore(File(app.filesDir, "chat_history"))
     private val conversationOwner = UUID.randomUUID().toString()
@@ -83,6 +87,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var messages by mutableStateOf(initialChat.messages)
     var input by mutableStateOf(initialChat.draft)
     var attachments by mutableStateOf(initialChat.attachments)
+    var archiveBusy by mutableStateOf(false)
+        private set
+    var pendingDownload by mutableStateOf<DownloadCheck?>(null)
+        private set
     var busy by mutableStateOf(false)
     var info by mutableStateOf<String?>(null)
     var visionOnly by mutableStateOf(false)
@@ -134,17 +142,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var flushing = false
     @Volatile
     private var stopRequested = false
+    @Volatile private var lastProcessRam = 0L
     private var streamStartedAt = 0L
+    @Volatile private var requestControl = RequestControl()
+    @Volatile private var localGenerating = false
+    @Volatile private var generatedTokens = 0
+    @Volatile private var knownTokenCount = false
+    @Volatile private var generationMillis = 0L
     @Volatile private var firstTokenAt = 0L
     @Volatile private var requestStage = "обработка запроса"
-    private data class SaveRequest(val snapshot: ChatSnapshot, val deleteId: String? = null)
+    private data class SaveRequest(val snapshot: ChatSnapshot, val deleteId: String? = null, val completion: CompletableDeferred<Unit>? = null)
     private val saveQueue = Channel<SaveRequest>(Channel.UNLIMITED)
     private val storageScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val draftSave = Runnable { saveActiveChat() }
 
     private val flusher = object : Runnable {
         override fun run() {
-            if (busy) {
+            if (busy || archiveBusy) {
                 val seconds = (SystemClock.elapsedRealtime() - streamStartedAt) / 1000
                 generationStatus = if (firstTokenAt == 0L) "$requestStage / ${seconds} с"
                     else "генерация ответа / ${seconds} с"
@@ -167,7 +181,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching {
                     chatStore.save(request.snapshot, discardPrevious = request.deleteId != null)
                     request.deleteId?.let { chatStore.deleteAttachments(it) }
-                }.onFailure { error -> handler.post { showInfo("не удалось сохранить чаты: ${error.message}") } }
+                    request.completion?.complete(Unit)
+                }.onFailure { error -> request.completion?.completeExceptionally(error); handler.post { showInfo("не удалось сохранить чаты: ${error.message}") } }
             }
             storageScope.cancel()
         }
@@ -214,7 +229,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             showInfo("сначала скачайте модель")
             return
         }
-        if (busy) {
+        if (busy || archiveBusy) {
             showInfo("дождитесь ответа")
             return
         }
@@ -239,7 +254,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun newChat() {
-        if (busy) {
+        if (busy || archiveBusy) {
             showInfo("сначала остановите ответ")
             return
         }
@@ -260,7 +275,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectChat(id: String) {
-        if (busy) { showInfo("сначала остановите ответ"); return }
+        if (busy || archiveBusy) { showInfo("сначала остановите ответ"); return }
         if (id == activeChatId) { catalogVisible = false; settingsVisible = false; return }
         saveActiveChat()
         chats.firstOrNull { it.id == id }?.let { activateChat(it) }
@@ -270,7 +285,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun deleteChat(id: String) {
-        if (busy) { showInfo("сначала остановите ответ"); return }
+        if (busy || archiveBusy) { showInfo("сначала остановите ответ"); return }
         if (chats.none { it.id == id }) return
         saveActiveChat(persist = false)
         chats = chats.filterNot { it.id == id }
@@ -292,6 +307,85 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         if (persist) saveQueue.trySend(SaveRequest(ChatSnapshot(activeChatId, chats)))
+    }
+
+    fun exportChats(uri: Uri, all: Boolean) {
+        if (busy || archiveBusy) return
+        saveActiveChat()
+        val snapshot = ChatSnapshot(activeChatId, if (all) chats else chats.filter { it.id == activeChatId })
+        archiveBusy = true
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching {
+                val stage = Files.createTempDirectory(getApplication<Application>().cacheDir.toPath(), "chat-export-").toFile()
+                try {
+                    getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use { output ->
+                        ChatArchive.export(snapshot, chatStore, stage, output)
+                    } ?: error("не удалось открыть файл архива")
+                } finally { stage.deleteRecursively() }
+            } }
+            archiveBusy = false
+            showInfo(result.fold({ "архив сохранён вместе с вложениями" }, { "экспорт не выполнен: ${it.message}" }))
+        }
+    }
+
+    fun importChats(uri: Uri) {
+        if (busy || archiveBusy) return
+        saveActiveChat()
+        archiveBusy = true
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching {
+                val stage = Files.createTempDirectory(getApplication<Application>().cacheDir.toPath(), "chat-import-").toFile()
+                val created = mutableListOf<String>()
+                try {
+                    val snapshot = getApplication<Application>().contentResolver.openInputStream(uri)?.use { ChatArchive.read(it, stage) }
+                        ?: error("не удалось открыть архив")
+                    snapshot.chats.map { chat ->
+                        val id = UUID.randomUUID().toString().also { created += it }
+                        ChatArchive.remap(chat, ChatStore(stage), chatStore, id)
+                    }
+                } catch (e: Throwable) {
+                    created.forEach { chatStore.deleteAttachments(it) }
+                    throw e
+                } finally { stage.deleteRecursively() }
+            } }
+            archiveBusy = false
+            result.onSuccess { imported ->
+                val unique = imported.map { chat -> chat.copy(messages = chat.messages.map { it.copy(id = nextId++) }) }
+                chats = unique + chats
+                saveActiveChat()
+                showInfo("добавлено чатов: ${unique.size}")
+            }.onFailure { showInfo("импорт не выполнен: ${it.message}") }
+        }
+    }
+
+    /** Edits and regeneration create a branch, keeping the original conversation intact. */
+    fun reviseMessage(messageId: Long, replacement: String? = null) {
+        if (busy || archiveBusy) return
+        val index = messages.indexOfFirst { it.id == messageId }
+        if (index < 0) return
+        val userIndex = (index downTo 0).firstOrNull { messages[it].fromUser } ?: return
+        val origin = chats.first { it.id == activeChatId }.copy(messages = messages.take(userIndex + 1), attachments = emptyList())
+        val id = UUID.randomUUID().toString()
+        saveActiveChat()
+        archiveBusy = true
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching {
+                ChatArchive.remap(origin, chatStore, chatStore, id)
+            }.onFailure { chatStore.deleteAttachments(id) } }
+            archiveBusy = false
+            result.onSuccess { copied ->
+                val question = copied.messages.last()
+                val prefix = copied.messages.dropLast(1)
+                val atts = question.attachedFiles.ifEmpty { question.images.map { Attachment(it, it.name, "image/*", true) } }
+                val branch = copied.copy(title = "ветка: ${origin.title}", messages = prefix,
+                    context = ChatHistory.bounded(prefix.filterNot { it.isError }.map { ChatTurn(if (it.fromUser) "user" else "assistant", it.text) }),
+                    draft = replacement ?: question.text, attachments = atts)
+                chats = listOf(branch) + chats
+                activateChat(branch)
+                saveActiveChat()
+                send()
+            }.onFailure { showInfo("не удалось создать ветку: ${it.message}") }
+        }
     }
 
     fun updateInput(value: String) {
@@ -361,7 +455,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ---------------- chat ----------------
 
     fun send() {
-        if (busy) return
+        if (busy || archiveBusy) return
+        voice.cancelListening()
         val text = input.trim()
         val atts = attachments
         if (text.isEmpty() && atts.isEmpty()) return
@@ -402,7 +497,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             fromUser = true,
             text = text,
             images = atts.filter { it.isImage }.map { it.file },
-            files = atts.filterNot { it.isImage }.map { it.name }
+            files = atts.filterNot { it.isImage }.map { it.name },
+            attachedFiles = atts
         )
         val assistant = UiMessage(id = nextId++, fromUser = false, text = "")
         messages = messages + user + assistant
@@ -415,6 +511,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         firstTokenAt = 0L
         generationStatus = "обработка запроса"
         stopRequested = false
+        requestControl = RequestControl()
+        generatedTokens = 0
+        knownTokenCount = false
+        generationMillis = 0
         val label = if (apiEnabled) apiModel else selected?.name.orEmpty()
         chats = chats.map { if (it.id == activeChatId) it.copy(modelLabel = label) else it }
         saveActiveChat()
@@ -434,6 +534,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             s
         }
         if (chunk.isNotEmpty()) appendToStream(chunk)
+        val elapsed = SystemClock.elapsedRealtime() - streamStartedAt
+        val stats = GenerationStats(if (firstTokenAt > 0) firstTokenAt - streamStartedAt else -1, elapsed,
+            if (knownTokenCount) generatedTokens else null, generationMillis, lastProcessRam,
+            if (apiEnabled) apiModel else selected?.name.orEmpty())
+        messages = messages.map { if (it.id == streamId) it.copy(stats = stats) else it }
         busy = false
         generationStatus = ""
         if (firstTokenAt > 0L) {
@@ -462,11 +567,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             var finalAnswer = ""
             try {
                 if (LocalEngine.loadedModelId != model.id) {
+                    requestStage = "загружаю модель"
                     val rc = withContext(Dispatchers.IO) { LocalEngine.load(getApplication(), store, model) }
                     if (rc != 0) throw IllegalStateException("не удалось загрузить модель")
                 }
                 val maxSide = if (detailedVision) model.imageMaxSide else minOf(448, model.imageMaxSide)
+                requestControl.checkActive()
+                requestStage = if (atts.any { it.isImage }) "обрабатываю фото" else "читаю вложения"
                 val prepared = ContentPrep.prepare(atts, maxSide)
+                requestControl.checkActive()
                 var full = buildString {
                     if (text.isNotEmpty()) append(text)
                     if (prepared.text.isNotBlank()) {
@@ -476,10 +585,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val preparedWeb = Web.preparePrompt(full, internetEnabled, question = text,
                     automaticSearch = !(filesEnabled && SharedFileTools.needsLocalFiles(text)),
-                    onStatus = { requestStage = it })
+                    onStatus = { requestStage = it }, control = requestControl)
                 webPrompt = preparedWeb
                 full = preparedWeb.text
-                requestStage = "обработка запроса"
+                requestStage = if (prepared.images.isNotEmpty()) "обрабатываю фото" else "генерирую ответ"
                 val images = prepared.images
                 val fileTools = DeviceFiles.create(getApplication())
                 full += fileTools.initialContext(text)
@@ -490,13 +599,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 while (true) {
                     if (stopRequested) break
                     val answer = StringBuilder()
+                    requestStage = "ожидаю освобождения модели"
                     LocalEngine.exclusive {
+                        localGenerating = true
+                        try {
                         if (LocalEngine.load(getApplication(), store, model) != 0) {
                             throw IllegalStateException("не удалось загрузить модель или проектор зрения")
                         }
                         if (stopRequested) throw IllegalStateException("stopped")
-                        LocalEngine.useConversation("$conversationOwner/$requestChatId", context, system)
+                        requestStage = "восстанавливаю контекст"
+                        LocalEngine.useConversation("$conversationOwner/$requestChatId", context, system, cancelled = { stopRequested })
                         if (stopRequested) throw IllegalStateException("stopped")
+                        requestStage = if (round == 0 && images.isNotEmpty()) "обрабатываю фото" else "генерирую ответ"
                         LocalEngine.chat(
                             full,
                             if (round == 0) images.map { it.rgb }.toTypedArray() else emptyArray(),
@@ -505,12 +619,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             768, 0.7f, 0.95f, 40, 1.1f, system,
                             object : TokenSink {
                                 override fun onToken(text: String) {
+                                    if (stopRequested) { LocalEngine.stop(); return }
                                     if (firstTokenAt == 0L) firstTokenAt = SystemClock.elapsedRealtime()
                                     synchronized(streamBuffer) { streamBuffer.append(text) }
                                     answer.append(text)
                                 }
-                            }
+                                override fun onStats(tokens: Int, generationMs: Long) {
+                                    generatedTokens += tokens
+                                    generationMillis += generationMs
+                                    knownTokenCount = true
+                                }
+                            }, cancelled = { stopRequested }
                         )
+                        } finally { localGenerating = false }
                     }
                     finalAnswer = answer.toString()
                     context += ChatTurn("user", full)
@@ -519,17 +640,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val fileResult = if (SharedFileTools.hasCommand(finalAnswer))
                         fileTools.execute(finalAnswer, ::confirmFileChange) else null
                     full = if (fileResult != null) "Результат файлового инструмента:\n$fileResult\nПродолжи ответ на исходный вопрос."
-                        else if (internetEnabled) Web.followUp(finalAnswer, preparedWeb) ?: break
+                        else if (internetEnabled) Web.followUp(finalAnswer, preparedWeb, control = requestControl, onStatus = { requestStage = it }) ?: break
                         else break
                     clearCurrentStream()
                     round++
                 }
             } catch (e: Throwable) {
-                error = e.message ?: e.javaClass.simpleName
+                error = if (stopRequested) "stopped" else e.message ?: e.javaClass.simpleName
             }
 
+            lastProcessRam = Debug.getPss() * 1024L
             withContext(Dispatchers.Main) {
                 finishStream(error)
+                messages = messages.map { if (it.id == streamId) it.copy(sources = webPrompt?.sources?.distinctBy { s -> s.url }.orEmpty()) else it }
                 if (error == null && !stopRequested) {
                     messages = messages.map {
                         if (it.id == streamId) it.copy(text = webPrompt?.let { context ->
@@ -551,7 +674,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             var webPrompt: Web.PreparedPrompt? = null
             var finalAnswer = ""
             try {
+                requestControl.checkActive()
+                requestStage = if (atts.any { it.isImage }) "обрабатываю фото" else "читаю вложения"
                 val prepared = ContentPrep.prepare(atts, 1280)
+                requestControl.checkActive()
                 var full = buildString {
                     if (text.isNotEmpty()) append(text)
                     if (prepared.text.isNotBlank()) {
@@ -561,10 +687,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val preparedWeb = Web.preparePrompt(full, internetEnabled, question = text,
                     automaticSearch = !(filesEnabled && SharedFileTools.needsLocalFiles(text)),
-                    onStatus = { requestStage = it })
+                    onStatus = { requestStage = it }, control = requestControl)
                 webPrompt = preparedWeb
                 full = preparedWeb.text
-                requestStage = "обработка запроса"
+                requestStage = "генерирую ответ"
                 val turns = ArrayList<RemoteTurn>()
                 val fileTools = DeviceFiles.create(getApplication())
                 full += fileTools.initialContext(text)
@@ -591,18 +717,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 var contextPrompt = full
                 for (round in 0..4) {
                     if (stopRequested) break
-                    val answer = RemoteApi.stream(apiBaseUrl, apiKey, apiModel, turns) { piece ->
+                    val generationStart = SystemClock.elapsedRealtime()
+                    val answer = RemoteApi.stream(apiBaseUrl, apiKey, apiModel, turns, control = requestControl,
+                        onUsage = { generatedTokens += it; knownTokenCount = true }) { piece ->
                         if (stopRequested) throw IllegalStateException("stopped")
                         if (firstTokenAt == 0L) firstTokenAt = SystemClock.elapsedRealtime()
                         synchronized(streamBuffer) { streamBuffer.append(piece) }
                     }
+                    generationMillis += SystemClock.elapsedRealtime() - generationStart
                     finalAnswer = answer
                     context += ChatTurn("user", contextPrompt)
                     context += ChatTurn("assistant", answer)
                     if (stopRequested || round >= 4) break
                     val fileResult = if (SharedFileTools.hasCommand(answer)) fileTools.execute(answer, ::confirmFileChange) else null
                     val result = if (fileResult != null) "Результат файлового инструмента:\n$fileResult\nПродолжи ответ на исходный вопрос."
-                        else if (internetEnabled) Web.followUp(answer, preparedWeb) ?: break
+                        else if (internetEnabled) Web.followUp(answer, preparedWeb, control = requestControl, onStatus = { requestStage = it }) ?: break
                         else break
                     clearCurrentStream()
                     turns += RemoteTurn("assistant", answer)
@@ -610,10 +739,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     contextPrompt = result
                 }
             } catch (e: Throwable) {
-                error = e.message ?: e.javaClass.simpleName
+                error = if (stopRequested) "stopped" else e.message ?: e.javaClass.simpleName
             }
+            lastProcessRam = Debug.getPss() * 1024L
             withContext(Dispatchers.Main) {
                 finishStream(error)
+                messages = messages.map { if (it.id == streamId) it.copy(sources = webPrompt?.sources?.distinctBy { s -> s.url }.orEmpty()) else it }
                 if (error == null && !stopRequested) {
                     messages = messages.map {
                         if (it.id == streamId) it.copy(text = webPrompt?.let { context ->
@@ -679,8 +810,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         stopRequested = true
+        generationStatus = "останавливаю запрос"
+        requestControl.cancel()
         respondToFileChange(false)
-        LocalEngine.stop()
+        if (localGenerating) LocalEngine.stop()
     }
 
     fun updateFilesEnabled(enabled: Boolean) {
@@ -718,6 +851,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ---------------- downloads ----------------
 
     fun download(model: CatalogModel) {
+        val capacity = Compatibility.capacity(getApplication())
+        val remaining = model.files.sumOf { (it.bytes - maxOf(store.file(model, it).length(), store.partFile(model, it).length())).coerceAtLeast(0) }
+        pendingDownload = DownloadCheck(model, capacity, Compatibility.assess(model, capacity, remaining))
+    }
+
+    fun confirmDownload(approve: Boolean) {
+        val model = pendingDownload?.model ?: return
+        pendingDownload = null
+        if (!approve) return
         if (deletingModelId != null) return
         if (Downloads.isActive(model.id)) return
         if (store.isInstalled(model)) return
@@ -887,8 +1029,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun localAddress(): String = LanHost.address
 
     override fun onCleared() {
+        voice.close()
         handler.removeCallbacksAndMessages(null)
-        if (busy) { stopRequested = true; LocalEngine.stop() }
+        if (busy) stop()
         respondToFileChange(false)
         val remaining = synchronized(streamBuffer) { streamBuffer.toString().also { streamBuffer.setLength(0) } }
         if (remaining.isNotEmpty()) appendToStream(remaining)

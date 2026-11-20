@@ -11,7 +11,7 @@ function element() {
 }
 
 async function check() {
-  const elements = Object.fromEntries(['log', 'model', 'text', 'send'].map(k => [k, element()]));
+  const elements = Object.fromEntries(['log', 'model', 'text', 'send', 'reset', 'stop'].map(k => [k, element()]));
   const calls = [];
   let loaded = null;
   let failLoad = false;
@@ -47,6 +47,10 @@ async function check() {
   await context.sendMsg();
   assert.equal(calls.filter(x => x.startsWith('/api/chat')).length, before);
   assert.equal(elements.log.children.at(-1).textContent, 'не удалось загрузить');
+  await elements.stop.onclick();
+  assert.equal(calls.at(-1), '/api/stop');
+  await elements.reset.onclick();
+  assert.equal(calls.at(-1), '/api/reset');
   console.log('PASS: first model load, UTF-8/chunked SSE, final text, controls and load failure');
 }
 check().catch(e => { console.error(e); process.exitCode = 1; });

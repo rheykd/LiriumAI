@@ -94,10 +94,10 @@ class FocusedSearchTest {
             assertEquals(question, original)
             "Погода Санкт-Петербург: -3 °C."
         }
-        assertNull(Web.followUp("FETCH https://example.com/roblox", prepared, lookup))
-        val result = Web.followUp("SEARCH Roblox passport", prepared, lookup)
+        assertNull(Web.followUp("FETCH https://example.com/roblox", prepared, lookup = lookup))
+        val result = Web.followUp("SEARCH Roblox passport", prepared, lookup = lookup)
         assertTrue(result!!.contains(question))
-        assertNull(Web.followUp("SEARCH another topic", prepared, lookup))
+        assertNull(Web.followUp("SEARCH another topic", prepared, lookup = lookup))
         assertEquals(1, calls)
     }
 }

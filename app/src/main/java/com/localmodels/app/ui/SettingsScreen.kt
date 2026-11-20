@@ -62,14 +62,12 @@ import com.localmodels.app.AppViewModel
 import com.localmodels.app.BuildConfig
 import com.localmodels.app.data.LanHost
 import com.localmodels.app.data.DeviceFiles
-import com.localmodels.app.data.SystemPrompt
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 
 @Composable
 fun SettingsScreen(vm: AppViewModel) {
     var catalogOpen by remember { mutableStateOf(false) }
-    var promptOpen by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val lanPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) vm.updateLanEnabled(true)
@@ -104,10 +102,6 @@ fun SettingsScreen(vm: AppViewModel) {
             item { Divider() }
             item { SectionLabel("файлы устройства") }
             item { FileAccessSettings(vm) }
-            item { Divider() }
-            item {
-                TextButton(onClick = { promptOpen = true }) { Text("системная инструкция модели", color = TextPrimary) }
-            }
             item { Divider() }
             item { SectionLabel("каталог") }
             item {
@@ -201,6 +195,13 @@ fun SettingsScreen(vm: AppViewModel) {
                 }
             }
             item { PasswordSetting(vm) }
+            item { LanClientsSettings() }
+            item { Divider() }
+            item { SectionLabel("голос") }
+            item { VoiceSettings(vm) }
+            item { Divider() }
+            item { SectionLabel("резервная копия") }
+            item { BackupActions(vm) }
 
             item { Divider() }
             item { SectionLabel("зрение") }
@@ -247,14 +248,7 @@ fun SettingsScreen(vm: AppViewModel) {
     if (catalogOpen) {
         CatalogDialog(vm) { catalogOpen = false }
     }
-    if (promptOpen) {
-        AlertDialog(onDismissRequest = { promptOpen = false }, containerColor = Surface,
-            title = { Text("системная инструкция") },
-            text = { Text(SystemPrompt.build(vm.internetEnabled,
-                if (vm.filesEnabled && DeviceFiles.hasPermission(context)) DeviceFiles.create(context).instruction else ""),
-                modifier = Modifier.verticalScroll(rememberScrollState())) },
-            confirmButton = { TextButton(onClick = { promptOpen = false }) { Text("закрыть") } })
-    }
+
 }
 
 @Composable

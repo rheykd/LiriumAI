@@ -9,7 +9,8 @@ import org.json.JSONObject
 
 data class ChatMessage(
     val id: Long, val fromUser: Boolean, val text: String,
-    val images: List<File> = emptyList(), val files: List<String> = emptyList(), val isError: Boolean = false
+    val images: List<File> = emptyList(), val files: List<String> = emptyList(), val isError: Boolean = false,
+    val attachedFiles: List<Attachment> = emptyList(), val sources: List<SourceRef> = emptyList(), val stats: GenerationStats? = null
 )
 data class ChatTurn(val role: String, val text: String)
 data class ChatRecord(
@@ -50,6 +51,17 @@ class ChatStore(val root: File) {
         return f.takeIf { it.path.startsWith(attachments.path + File.separator) && it.isFile }
     }
 
+    private fun legacyAttachments(message: JSONObject, chatId: String): List<Attachment> {
+        val images = message.optJSONArray("images").strings().mapNotNull { savedFile(it, chatId) }
+            .map { Attachment(it, it.name, "image/*", true) }
+        val documents = message.optJSONArray("files").strings().mapNotNull { name ->
+            val safe = name.replace(Regex("[^\\p{L}\\p{N}._-]"), "_")
+            val matches = attachmentDirectory(chatId).listFiles().orEmpty().filter { it.isFile && it.name.endsWith("_$safe") }
+            matches.singleOrNull()?.let { Attachment(it, name, if (name.endsWith(".pdf", true)) "application/pdf" else "application/octet-stream", false) }
+        }
+        return images + documents
+    }
+
     @Synchronized fun load(): ChatSnapshot? {
         for (source in listOf(file, backup)) {
             if (!source.isFile) continue
@@ -65,7 +77,13 @@ class ChatStore(val root: File) {
                             val m = list.getJSONObject(i)
                             ChatMessage(m.getLong("id"), m.getBoolean("fromUser"), m.getString("text"),
                                 m.optJSONArray("images").strings().mapNotNull { savedFile(it, id) },
-                                m.optJSONArray("files").strings(), m.optBoolean("isError"))
+                                m.optJSONArray("files").strings(), m.optBoolean("isError"),
+                                m.optJSONArray("attachedFiles")?.let { a -> (0 until a.length()).mapNotNull { k ->
+                                    val item = a.getJSONObject(k)
+                                    savedFile(item.getString("file"), id)?.let { Attachment(it, item.getString("name"), item.getString("mime"), item.getBoolean("isImage")) }
+                                } } ?: legacyAttachments(m, id),
+                                m.optJSONArray("sources")?.let { a -> (0 until a.length()).map { SourceRef.parse(a.getJSONObject(it)) } }.orEmpty(),
+                                m.optJSONObject("stats")?.let { GenerationStats.parse(it) })
                         }
                     }
                     val context = c.optJSONArray("context")?.let { list ->
@@ -103,7 +121,9 @@ class ChatStore(val root: File) {
             val messages = JSONArray()
             chat.messages.forEach { m ->
                 messages.put(JSONObject().put("id", m.id).put("fromUser", m.fromUser).put("text", m.text)
-                    .put("images", JSONArray(m.images.map(::relative))).put("files", JSONArray(m.files)).put("isError", m.isError))
+                    .put("images", JSONArray(m.images.map(::relative))).put("files", JSONArray(m.files)).put("isError", m.isError)
+                    .put("attachedFiles", JSONArray(m.attachedFiles.map { a -> JSONObject().put("file", relative(a.file)).put("name", a.name).put("mime", a.mime).put("isImage", a.isImage) }))
+                    .put("sources", JSONArray(m.sources.map { it.json() })).put("stats", m.stats?.json() ?: JSONObject.NULL))
             }
             val context = JSONArray()
             ChatHistory.bounded(chat.context).forEach { context.put(JSONObject().put("role", it.role).put("text", it.text)) }

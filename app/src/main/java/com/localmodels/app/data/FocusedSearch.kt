@@ -67,7 +67,8 @@ object FocusedSearch {
         question: String,
         searcher: suspend (String) -> String,
         fetcher: suspend (String) -> String,
-        onStatus: (String) -> Unit = {}
+        onStatus: (String) -> Unit = {},
+        onSource: (SourceRef) -> Unit = {}
     ): String {
         val query = query(question)
         val hits = parse(searcher(query))
@@ -79,6 +80,7 @@ object FocusedSearch {
         val page = fetcher(hit.url)
         val relevant = extract(page, query)
         val snippet = hit.snippet.takeIf { score(it, query) > 0 }?.take(1000).orEmpty()
+        onSource(SourceRef(hit.title, hit.url, relevant.ifBlank { snippet }))
         return "Запрос: $query\nИсточник: ${hit.title}\n${hit.url}\n" +
             when {
                 relevant.isNotBlank() -> "Выдержки по запросу:\n$relevant"

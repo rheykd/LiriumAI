@@ -22,7 +22,9 @@ object LocalEngine {
         }
     }
 
-    fun useConversation(id: String, history: List<ChatTurn>, system: String) = lock.withLock {
+    fun useConversation(id: String, history: List<ChatTurn>, system: String, cancelled: () -> Boolean = { false }) = lock.withLock {
+        LlamaBridge.clearStop()
+        if (cancelled()) throw IllegalStateException("stopped")
         val key = "chat:$id:model:$loadedModelId:system:$system"
         sessions.ensure(key) {
             LlamaBridge.restoreHistory(history.map { it.role }.toTypedArray(), history.map { it.text }.toTypedArray(), system)
@@ -91,14 +93,19 @@ object LocalEngine {
         topK: Int,
         repeatPenalty: Float,
         system: String?,
-        sink: TokenSink
+        sink: TokenSink,
+        cancelled: () -> Boolean = { false }
     ) {
         lock.withLock {
+            LlamaBridge.clearStop()
+            if (cancelled()) throw IllegalStateException("stopped")
             try { LlamaBridge.chat(
                 text, images, widths, heights,
                 maxTokens, temp, topP, topK, repeatPenalty,
                 system ?: "", sink
-            ) } catch (e: Throwable) { sessions.invalidate(); throw e }
+            )
+                if (cancelled()) sessions.invalidate()
+            } catch (e: Throwable) { sessions.invalidate(); throw e }
         }
     }
 

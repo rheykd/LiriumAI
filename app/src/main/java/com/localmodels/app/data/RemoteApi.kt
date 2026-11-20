@@ -23,6 +23,8 @@ object RemoteApi {
         apiKey: String,
         model: String,
         turns: List<RemoteTurn>,
+        control: RequestControl? = null,
+        onUsage: (Int) -> Unit = {},
         onToken: (String) -> Unit
     ): String = withContext(Dispatchers.IO) {
         val endpoint = endpoint(baseUrl)
@@ -66,7 +68,9 @@ object RemoteApi {
             if (apiKey.isNotBlank()) setRequestProperty("Authorization", "Bearer $apiKey")
         }
 
+        control?.register(conn)
         try {
+            control?.checkActive()
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             if (code !in 200..299) {
@@ -82,6 +86,7 @@ object RemoteApi {
             conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
                 if (contentType.contains("application/json") && !contentType.contains("event-stream")) {
                     val text = reader.readText()
+                    JSONObject(text).optJSONObject("usage")?.let { if (it.has("completion_tokens")) onUsage(it.getInt("completion_tokens")) }
                     val content = runCatching {
                         JSONObject(text).getJSONArray("choices").getJSONObject(0)
                             .getJSONObject("message").opt("content") as? String ?: ""
@@ -93,11 +98,14 @@ object RemoteApi {
                     return@withContext result.toString()
                 }
                 while (true) {
+                    control?.checkActive()
                     val line = reader.readLine() ?: break
                     if (!line.startsWith("data:")) continue
                     val payload = line.removePrefix("data:").trim()
-                    if (payload.isEmpty() || payload == "[DONE]") continue
+                    if (payload.isEmpty()) continue
+                    if (payload == "[DONE]") break
                     val obj = runCatching { JSONObject(payload) }.getOrNull() ?: continue
+                    obj.optJSONObject("usage")?.let { if (it.has("completion_tokens")) onUsage(it.getInt("completion_tokens")) }
                     if (obj.has("error")) {
                         val msg = obj.optJSONObject("error")?.optString("message")
                             ?: obj.optString("error")
@@ -116,6 +124,7 @@ object RemoteApi {
             }
             result.toString()
         } finally {
+            control?.release(conn)
             conn.disconnect()
         }
     }

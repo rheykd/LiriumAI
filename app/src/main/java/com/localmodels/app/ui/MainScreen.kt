@@ -97,6 +97,8 @@ fun LiriumApp(vm: AppViewModel) {
             else -> ChatScreen(vm, onChats = { scope.launch { drawer.open() } })
         }
     }
+    DownloadCompatibilityDialog(vm)
+    VoiceLifecycle(vm)
     vm.pendingFileChange?.let { change ->
         AlertDialog(
             onDismissRequest = { vm.respondToFileChange(false) },
@@ -247,13 +249,19 @@ private fun ChatScreen(vm: AppViewModel, onChats: () -> Unit) {
                 items(vm.messages, key = { it.id }) { message ->
                     MessageRow(
                         message = message,
+                        vm = vm,
                         streaming = vm.busy && message.id == vm.messages.lastOrNull()?.id && !message.fromUser
                     )
                 }
             }
         }
 
-        if (vm.busy) InfoLine(vm.generationStatus) { }
+        if (vm.busy) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(vm.generationStatus, color = TextSecondary, modifier = Modifier.weight(1f).padding(12.dp),
+                style = androidx.compose.material3.MaterialTheme.typography.labelSmall)
+            TextButton(onClick = vm::stop) { Text("отмена") }
+        }
+        if (vm.archiveBusy) InfoLine("обрабатываю архив или вложения") { }
         vm.info?.let { text ->
             InfoLine(text) { vm.info = null }
         }
@@ -283,7 +291,8 @@ private fun InfoLine(text: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun MessageRow(message: UiMessage, streaming: Boolean) {
+private fun MessageRow(message: UiMessage, vm: AppViewModel, streaming: Boolean) {
+    Column(Modifier.fillMaxWidth()) {
     if (message.fromUser) {
         Column(
             Modifier.fillMaxWidth(),
@@ -328,6 +337,8 @@ private fun MessageRow(message: UiMessage, streaming: Boolean) {
             }
         }
     }
+    if (!streaming) MessageTools(message, vm)
+    }
 }
 
 @Composable
@@ -371,7 +382,8 @@ private fun Composer(vm: AppViewModel, onPhoto: () -> Unit, onFile: () -> Unit) 
             }
         }
 
-        val canSend = (vm.input.isNotBlank() || vm.attachments.isNotEmpty()) && !vm.busy
+        VoiceInput(vm)
+        val canSend = (vm.input.isNotBlank() || vm.attachments.isNotEmpty()) && !vm.busy && !vm.archiveBusy
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.Bottom
